@@ -12,7 +12,7 @@ class LoadLimitExceeded(Exception):
     def __init__(self, retry_in: Optional[float] = None):
         super().__init__()
         self.retry_in = retry_in
-    def __str__(self) -> str:
+    def __str__(self) -> str: # pragma: no coverage
         return self.__repr__()
     def __repr__(self) -> str:
         s = 'LoadLimitExceeded'
@@ -30,7 +30,7 @@ class LoadLimiter(object):
     def __init__(
         self, 
         name: str = None,
-        maxload: int = 60,
+        maxload: float = 60,
         period: int = 60,
         fragmentation: float = 0.075,
         penalty_factor: float = 0.30,
@@ -43,9 +43,9 @@ class LoadLimiter(object):
     ):
         self.logger = logger if logger is not None else file_logger
 
-        if maxload < 1:
+        if maxload <= 0:
             raise ValueError('maxload should be a positive integer')
-        if period < 1:
+        if period <= 0:
             raise ValueError('period should be a positive integer')
         if fragmentation < 0.05 or fragmentation > 1.0:
             raise ValueError('fragmentation should be a positive float in the range 0.05 - 1.0')
@@ -61,11 +61,11 @@ class LoadLimiter(object):
             raise ValueError('max_penalty_cap_factor should not be negative')
         
         overstep_penalty = int(maxload * penalty_factor)
-        if overstep_penalty < 0:
+        if overstep_penalty <= 0:
             overstep_penalty = 0
         
         step_period = math.ceil(period * fragmentation)
-        if step_period < 1:
+        if step_period <= 1:
             step_period = 1
 
         num_max_buckets = math.ceil(period / step_period)
@@ -145,29 +145,24 @@ class LoadLimiter(object):
 
     def instant_load_factor(self) -> float:
         with self.lock:
-            if self.window_total == 0:
-                return 0
-            v = self.window_total / self.maxload
-            if v > 1.0:
-                v = 1.0
-            return v
+            return self._instant_load_factor()
+        
+    def _instant_load_factor(self) -> float:
+        self._rotate_window_to_current_time()
+        if self.window_total == 0:
+            return 0
+        v = self.window_total / self.maxload
+        return v
 
     def submit(self, load: float = 1) -> LoadLimiterSubmitResult:
         with self.lock:
             return self._submit(load=load)
 
-    def _submit( # NOSONAR - single function because it must be performance - optimized
-        self, 
-        load: float = 1
-    ) -> LoadLimiterSubmitResult:
-        self.num_calls += 1
+    def _rotate_window_to_current_time(self):
         t = time.time()
         t_start = int(int(t / self.step_period) * self.step_period)        
 
-        if len(self.queue) > 0 and self.queue[-1][0] == t_start:
-            # still same entry
-            entry = self.queue[-1]
-        else:
+        if len(self.queue) <= 0 or self.queue[-1][0] != t_start:
             entry = [t_start, 0]
             self.queue.append(entry)
 
@@ -177,35 +172,57 @@ class LoadLimiter(object):
                 first_el = self.queue[0]
                 if first_el[0] < remove_before:
                     self.window_total -= first_el[1]
-                    if self.window_total < 0:
-                        if abs(self.window_total) >= 0.1:
-                            self.logger.debug('corrected drift error (in descending direction): {} != 0'.format(self.window_total))
-                        self.window_total = 0
+                    self._correct_drifting_descending()
                     self.queue.popleft()
                 else:
                     break
+
+    def _correct_drifting_descending(self): # pragma: defensive
+        if self.window_total < 0:
+            if abs(self.window_total) >= 0.1:
+                self.logger.debug('corrected drift error (in descending direction): {} != 0'.format(self.window_total))
+            self.window_total = 0
+    
+    def _correct_driftin_ascending(self):  # pragma: defensive
+        retot = 0
+        for el in self.queue:
+            retot += el[1]
+        diff_abs = abs(retot - self.window_total)
+        if diff_abs > 0.001:
+            if diff_abs >= 0.1:
+                self.logger.debug('corrected drift error (in ascending direction): {} != {}'.format(self.window_total, retot))
+            self.window_total = retot
+
+    def _submit( # NOSONAR - single function because it must be performance - optimized
+        self, load: float = 1
+    ) -> LoadLimiterSubmitResult:
+        t = time.time()
+        self.num_calls += 1
+
+        self._rotate_window_to_current_time()
+        entry = self.queue[-1]
         
         p_before = 100.0 * self.window_total / self.maxload
         response_tta = None
 
-        self.window_total += load
-        entry[1] += load
-
-        if self.window_total <= self.maxload:        
+        total_would_be = self.window_total + load
+        if total_would_be > self.maxload:
+            ret = False
+        else:
             ret = True
             self.was_over = False
-        else:
-            ret = False
+
+            self.window_total += load
+            entry[1] += load
+
+        over_max_cap = self.window_total - self.max_cap
+        if over_max_cap > 0:
+            self._remove_from_oldest(over_max_cap)
+
+        if not ret:
             if not self.was_over:
                 # RECOMPUTE window_total FROM QUEUE VALUES TO AVOID LONG-RUNNING ROUNDING ERRORS
-                retot = 0
-                for el in self.queue:
-                    retot += el[1]
-                diff_abs = abs(retot - self.window_total)
-                if diff_abs > 0.001:
-                    if diff_abs >= 0.1:
-                        self.logger.debug('corrected drift error (in ascending direction): {} != {}'.format(self.window_total, retot))
-                    self.window_total = retot
+                self._correct_driftin_ascending()
 
                 if self.overstep_penalty > 0:
                     # apply penalty to last buckets
@@ -235,7 +252,7 @@ class LoadLimiter(object):
                     if acc_tta >= to_free_for_tta:
                         break
                 
-                if acc_tta < load:
+                if acc_tta < to_free_for_tta:
                     # no TTA can be computed (requested load > maxload ?)
                     response_tta = None
                 else:
@@ -252,15 +269,25 @@ class LoadLimiter(object):
         self.total_overhead += (time.time() - t)
         return LoadLimiterSubmitResult(ret, retry_in=response_tta)
 
+    def _remove_from_oldest(self, amount):
+        # try to remove from the left
+        for el in self.queue:
+            if el[1] > 0:
+                to_sub_from_bucket = min(el[1], amount)
+                el[1] -= to_sub_from_bucket
+                amount -= to_sub_from_bucket
+                self.window_total -= to_sub_from_bucket
+            if amount <= 0:
+                break
+        if amount > 0: # pragma: no coverage
+            # should never happen. just emit a warning
+            self.logger.warning('cannot sub excess over max cap starting from oldest entryies')
+
     def _distribute_penalty(self, amount, distribution_factor):
         qlen = len(self.queue)
         if qlen < 1:
             # no buckets!
             return
-
-        exceeds_cap = (self.window_total + amount) - self.max_cap
-        if exceeds_cap > 0:
-            amount -= exceeds_cap
 
         if amount <= 0:
             return
@@ -300,7 +327,12 @@ class LoadLimiter(object):
 
             b[1] += amount_for_bucket
 
-    def _print_range(self, rmin, rmax, ret):
+        over_max_cap = self.window_total - self.max_cap
+        if over_max_cap > 0:
+            self._remove_from_oldest(over_max_cap)
+
+    def _print_range(self, rmin, rmax, ret): # pragma: no cover
+        ilf = self._instant_load_factor()
         p_step = 5
         acc = 0
         name_raw = self.name if self.name is not None else self.__class__
@@ -331,5 +363,5 @@ class LoadLimiter(object):
         line += '] '
 
         avg_oh = 1000 * (self.total_overhead / self.num_calls)
-        line += '({:1.0f}r {:1.2f}ms/r)'.format(self.num_calls, avg_oh)
+        line += '({:1.2f}inst {:1.0f}r {:1.2f}ms/r)'.format(ilf, self.num_calls, avg_oh)
         self.logger.debug(line)
