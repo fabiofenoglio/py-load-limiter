@@ -335,7 +335,7 @@ class LoadLimiter(object):
         ilf = self._instant_load_factor()
         p_step = 5
         acc = 0
-        name_raw = self.name if self.name is not None else self.__class__
+        name_raw = self.name if self.name is not None else self.__class__.__name__
         if len(name_raw) > 12:
             name_raw = name_raw[:4] + '...' + name_raw[-4:]
         line = '[{:12s}] ['.format(name_raw)
