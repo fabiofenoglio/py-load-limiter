@@ -2,7 +2,7 @@ import unittest
 import datetime
 from freezegun import freeze_time
 
-from load_limiter import LoadLimiter, LoadLimitExceeded
+from py_load_limiter import LoadLimiter, LoadLimitExceeded, InMemoryLoadLimiterStorageAdapter
 
 class TestLoadLimiter(unittest.TestCase):
 
@@ -123,6 +123,110 @@ class TestLoadLimiter(unittest.TestCase):
             do_expensive()
             self.assertEqual(limiter.instant_load_factor(), 0.5)
             self.assertEqual(submitted[0], 15)
+
+    def test_status_dump(self):
+        limiter = LoadLimiter(maxload=10, period=2)
+        start_time = datetime.datetime.now()
+        
+        def assert_serialization_identity():
+            dump_before = limiter._dump_status()
+            limiter._restore_from_status(dump_before)
+            dump_after = limiter._dump_status()
+            self.assertDictEqual(dump_before.__dict__, dump_after.__dict__)
+
+        with freeze_time(start_time) as frozen_datetime:
+            assert_serialization_identity()
+
+            self.assertEqual(limiter.instant_load_factor(), 0.0)
+            self.assertTrue(limiter.submit(1).accepted)
+            assert_serialization_identity()
+            self.assertTrue(limiter.submit(1).accepted)
+            self.assertTrue(limiter.submit(2).accepted)
+            assert_serialization_identity()
+
+            frozen_datetime.tick(delta=datetime.timedelta(seconds=2))
+            assert_serialization_identity()
+            self.assertTrue(limiter.submit(1).accepted)
+            assert_serialization_identity()
+
+            frozen_datetime.tick(delta=datetime.timedelta(seconds=2))
+            assert_serialization_identity()
+            self.assertTrue(limiter.submit(3).accepted)
+            assert_serialization_identity()
+            self.assertTrue(limiter.submit(1).accepted)
+            assert_serialization_identity()
+
+            frozen_datetime.tick(delta=datetime.timedelta(seconds=5))
+            assert_serialization_identity()
+            self.assertTrue(limiter.submit(3).accepted)
+            assert_serialization_identity()
+            limiter.submit(3)
+            limiter.submit(3)
+            limiter.submit(3)
+            assert_serialization_identity()
+            limiter.submit(3)
+            limiter.submit(3)
+            self.assertFalse(limiter.submit(4).accepted)
+            assert_serialization_identity()
+
+            frozen_datetime.tick(delta=datetime.timedelta(seconds=8))
+            assert_serialization_identity()
+            self.assertTrue(limiter.submit(1).accepted)
+            assert_serialization_identity()
+
+    def test_storage_adapter(self):
+        start_time = datetime.datetime.now()
+
+        limiter = LoadLimiter(maxload=10, period=2, storage_adapter=InMemoryLoadLimiterStorageAdapter())
+
+        def assert_serialization_identity():
+            dump_before = limiter._dump_status()
+            self.assertTrue(limiter.flush(force=True))
+
+            self.assertTrue(limiter.restore())
+            dump_after = limiter._dump_status()
+
+            self.assertDictEqual(dump_before.__dict__, dump_after.__dict__)
+
+        with freeze_time(start_time) as frozen_datetime:
+            assert_serialization_identity()
+
+            self.assertEqual(limiter.instant_load_factor(), 0.0)
+            self.assertTrue(limiter.submit(1).accepted)
+            assert_serialization_identity()
+            self.assertTrue(limiter.submit(1).accepted)
+            self.assertTrue(limiter.submit(2).accepted)
+            assert_serialization_identity()
+
+            frozen_datetime.tick(delta=datetime.timedelta(seconds=2))
+            assert_serialization_identity()
+            self.assertTrue(limiter.submit(1).accepted)
+            assert_serialization_identity()
+
+            frozen_datetime.tick(delta=datetime.timedelta(seconds=2))
+            assert_serialization_identity()
+            self.assertTrue(limiter.submit(3).accepted)
+            assert_serialization_identity()
+            self.assertTrue(limiter.submit(1).accepted)
+            assert_serialization_identity()
+
+            frozen_datetime.tick(delta=datetime.timedelta(seconds=5))
+            assert_serialization_identity()
+            self.assertTrue(limiter.submit(3).accepted)
+            assert_serialization_identity()
+            limiter.submit(3)
+            limiter.submit(3)
+            limiter.submit(3)
+            assert_serialization_identity()
+            limiter.submit(3)
+            limiter.submit(3)
+            self.assertFalse(limiter.submit(4).accepted)
+            assert_serialization_identity()
+
+            frozen_datetime.tick(delta=datetime.timedelta(seconds=8))
+            assert_serialization_identity()
+            self.assertTrue(limiter.submit(1).accepted)
+            assert_serialization_identity()
 
 if __name__ == '__main__':
     unittest.main()

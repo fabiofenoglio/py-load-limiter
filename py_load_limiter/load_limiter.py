@@ -4,26 +4,11 @@ import math
 import threading
 import logging
 import contextlib, functools
-from typing import ContextManager, List, Optional
+from typing import ContextManager, Optional
 
-file_logger = logging.getLogger(__name__)
+from .types import LoadLimiterSubmitResult, LoadLimitExceeded
+from .persistence import LoadLimiterSerializedStatus, LoadLimiterStorageAdapter
 
-class LoadLimitExceeded(Exception):
-    def __init__(self, retry_in: Optional[float] = None):
-        super().__init__()
-        self.retry_in = retry_in
-    def __str__(self) -> str:
-        return self.__repr__()
-    def __repr__(self) -> str:
-        s = 'LoadLimitExceeded'
-        if self.retry_in is not None:
-            s += ' (load capacity available in {:.3f} seconds)'.format(self.retry_in) 
-        return s
-
-class LoadLimiterSubmitResult:
-    def __init__(self, accepted: bool, retry_in: Optional[float] = None):
-        self.accepted = accepted
-        self.retry_in = retry_in
 
 class LoadLimiter(object):
 
@@ -33,15 +18,16 @@ class LoadLimiter(object):
         maxload: float = 60,
         period: int = 60,
         fragmentation: float = 0.05,
-        penalty_factor: float = 0.00,
+        penalty_factor: float = 0.10,
         penalty_distribution_factor: float = 0.2,
         request_overhead_penalty_factor: float = 0.00,
         request_overhead_penalty_distribution_factor: float = 0.30,
-        max_penalty_cap_factor: float = 0.25,
+        max_penalty_cap_factor: float = 0.33,
         compute_tta: bool = True,
-        logger: logging.Logger = None
+        logger: logging.Logger = None,
+        storage_adapter: Optional[LoadLimiterStorageAdapter] = None
     ):
-        self.logger = logger if logger is not None else file_logger
+        self.logger = logger if logger is not None else logging.getLogger("loadlimiter")
 
         if maxload <= 0:
             raise ValueError('maxload should be a positive integer')
@@ -90,7 +76,10 @@ class LoadLimiter(object):
         self.total_overhead = 0
         self.was_over = False
 
+        self.status_dirty = False
+
         self.lock = threading.Lock()
+        self.storage_adapter = storage_adapter
     
     def __call__(self, load: int = 1, wait: bool = True, timeout: int = 60):
         """
@@ -129,6 +118,72 @@ class LoadLimiter(object):
         with self.lock:
             self._rotate_window_to_current_time()
             self._distribute_penalty(amount, 1.0)
+            self._status_dirty()
+
+    def flush(self, force = False) -> bool:
+        if not self.storage_adapter:
+            self.logger.warning('flush called but no storage adapter is available. status will not be dumped')
+            return False
+
+        if not self.status_dirty:
+            if not force:
+                self.logger.debug('flush called but instance is not dirty. status will not be dumped')
+                return False
+            else:
+                self.logger.debug('flush called but instance is not dirty. dumping anyway because force = True')
+
+        with self.lock:
+            status_dump = self._dump_status()
+            try:
+                self.storage_adapter.save(status_dump)
+            except Exception as e:
+                self.logger.error('error flushing status to storage adapter', exc_info=1)
+                raise e
+            self.logger.debug('status flushed to storage adapter')
+            self.status_dirty = False
+            return True
+
+    def restore(
+        self, 
+        from_status: Optional[LoadLimiterSerializedStatus] = None, 
+        from_adapter: Optional[LoadLimiterStorageAdapter] = None
+    ) -> bool:
+        if not self.storage_adapter and not from_adapter and not from_status:
+            self.logger.warning('restore called but no storage adapter is available. status will not be restored')
+            return False
+        if from_status and from_adapter:
+            raise ValueError('restore called with conflicting arguments. Only one of from_status and from_adapter allowed')
+
+        to_restore: Optional[LoadLimiterSerializedStatus] = None
+        if from_status:
+            to_restore = from_status
+        elif from_adapter:
+            try:
+                to_restore = from_adapter.read()
+            except Exception as e:
+                self.logger.error('error reading status from specified storage adapter', exc_info=1)
+                raise e
+        else:
+            try:
+                to_restore = self.storage_adapter.read()
+            except Exception as e:
+                self.logger.error('error reading status from embedded storage adapter', exc_info=1)
+                raise e
+
+        if not to_restore:
+            self.logger.debug('restore called but not status was found. status will not be restored')
+            return False
+
+        self.logger.debug('restoring status from dump')
+        with self.lock:
+            self._restore_from_status(to_restore)
+        self.logger.info('status restored from dump')
+
+        self.status_dirty = False
+        return True
+
+    def _status_dirty(self):
+        self.status_dirty = True
 
     def _submitting(self, load: int = 1, wait: bool = True, timeout: int = 60, task_name: str = None):
         _start = time.time()
@@ -179,6 +234,7 @@ class LoadLimiter(object):
                     self.window_total -= first_el[1]
                     self._correct_drifting_descending()
                     self.queue.popleft()
+                    self._status_dirty()
                 else:
                     break
 
@@ -186,6 +242,7 @@ class LoadLimiter(object):
         if self.window_total < 0:
             if abs(self.window_total) >= 0.1:
                 self.logger.debug('corrected drift error (in descending direction): {} != 0'.format(self.window_total))
+                self._status_dirty()
             self.window_total = 0
     
     def _correct_driftin_ascending(self):  # pragma: defensive
@@ -196,6 +253,7 @@ class LoadLimiter(object):
         if diff_abs > 0.001:
             if diff_abs >= 0.1:
                 self.logger.debug('corrected drift error (in ascending direction): {} != {}'.format(self.window_total, retot))
+                self._status_dirty()
             self.window_total = retot
 
     def _submit_probe(self, load: float):
@@ -233,6 +291,8 @@ class LoadLimiter(object):
             self._print_range(p_before, p_after, True)
 
         self.total_overhead += (time.time() - t)
+
+        self._status_dirty()
         return LoadLimiterSubmitResult(True, retry_in=response_tta)
 
     def _submit_reject(self, load: float):  # NOSONAR - single function because it must be performance - optimized
@@ -303,6 +363,8 @@ class LoadLimiter(object):
             #self._print_window()
 
         self.total_overhead += (time.time() - t)
+
+        self._status_dirty()
         return LoadLimiterSubmitResult(False, retry_in=response_tta)
 
     def _submit(
@@ -321,6 +383,7 @@ class LoadLimiter(object):
                 el[1] -= to_sub_from_bucket
                 amount -= to_sub_from_bucket
                 self.window_total -= to_sub_from_bucket
+                self._status_dirty()
             if amount <= 0:
                 break
         if amount > 0:
@@ -346,6 +409,7 @@ class LoadLimiter(object):
 
         self.window_total += amount
         last_bucket_start = self.queue[-1][0]
+        self._status_dirty()
         for ix in range(0, num_buckets_to_penalty):
             # check if the bucket exists
             expected_bucket_start_time = last_bucket_start - ix * self.step_period
@@ -374,6 +438,7 @@ class LoadLimiter(object):
         over_max_cap = self.window_total - self.max_cap
         if over_max_cap > 0:
             self._remove_from_oldest(over_max_cap)
+        self._status_dirty()
 
     def _print_window(self):
         window_bucket_format = '{:' + str(len(str(self.maxload))) + '.2f}'
@@ -418,74 +483,45 @@ class LoadLimiter(object):
         line += '({:1.2f}inst {:1.0f}r {:1.2f}ms/r)'.format(ilf, self.num_calls, avg_oh)
         self.logger.debug(line)
 
-class CompositeLoadLimiter(LoadLimiter):
-    def __init__(self,
-        name: str = None,
-        limiters: List[LoadLimiter] = None,
-        logger: logging.Logger = None
-    ):
-        if limiters is None or len(limiters) < 1:
-            raise ValueError('At least one limiter is required for composition')
+    def _dump_status(self) -> LoadLimiterSerializedStatus:
+        return LoadLimiterSerializedStatus(
+            name = self.name,
+            maxload = self.maxload,
+            period = self.period,
+            num_max_buckets = self.num_max_buckets,
+            max_cap = self.max_cap,
+            compute_tta = self.compute_tta,
+            overstep_penalty = self.overstep_penalty,
+            step_period = self.step_period,
+            penalty_distribution_factor = self.penalty_distribution_factor,
+            request_overhead_penalty_factor = self.request_overhead_penalty_factor,
+            request_overhead_penalty_distribution_factor = self.request_overhead_penalty_distribution_factor,
+            window_total = self.window_total,
+            num_calls = self.num_calls,
+            total_overhead = self.total_overhead,
+            was_over = self.was_over,
+            window = [e for e in self.queue]
+        )
 
-        self.name = name
-        self.limiters = limiters
-        self.logger = logger if logger is not None else file_logger
+    def _restore_from_status(self, status: LoadLimiterSerializedStatus):
+        self.name = status.name
+        self.maxload = status.maxload
+        self.period = status.period
+        self.num_max_buckets = status.num_max_buckets
+        self.max_cap = status.max_cap
+        self.compute_tta = status.compute_tta
+        self.overstep_penalty = status.overstep_penalty
+        self.step_period = status.step_period
+        self.penalty_distribution_factor = status.penalty_distribution_factor
+        self.request_overhead_penalty_factor = status.request_overhead_penalty_factor
+        self.request_overhead_penalty_distribution_factor = status.request_overhead_penalty_distribution_factor
+        self.window_total = status.window_total
+        self.num_calls = status.num_calls
+        self.total_overhead = status.total_overhead
+        self.was_over = status.was_over
 
-        self.lock = threading.Lock()
+        self.queue = collections.deque()
+        for e in status.window:
+            self.queue.append(e)
 
-        widest_limiter: Optional[LoadLimiter] = None
-        for candidate in limiters:
-            if widest_limiter is None or candidate.period > widest_limiter.period:
-                widest_limiter = candidate
-        self.widest_limiter = widest_limiter
-
-    def __getattr__(self, name):
-        if name == 'maxload':
-            return self.widest_limiter.maxload
-        elif name == 'period':
-            return self.widest_limiter.period
-        elif name == 'window_total':
-            return self.widest_limiter.window_total
-
-    def submit(self, load: float = 1) -> LoadLimiterSubmitResult:
-        all_accepted = True
-        highest_wait_time = None
-        rejections: List[LoadLimiterSubmitResult] = []
-        probes_accepted: List[LoadLimiter] = []
-        probes_rejected: List[LoadLimiter] = []
-        with self.lock:
-            
-            for limiter in self.limiters:
-                probe_result = limiter._submit_probe(load = load)
-                if probe_result:
-                    probes_accepted.append(limiter)
-                else:
-                    all_accepted = False
-                    probes_rejected.append(limiter)
-                    rejection_result = limiter._submit_reject(load = load)
-                    rejections.append(rejection_result)
-                    if rejection_result.retry_in is not None and (highest_wait_time is None or rejection_result.retry_in > highest_wait_time):
-                        highest_wait_time = rejection_result.retry_in
-
-            if all_accepted:
-                # if all accepted, confirm
-                for limiter in probes_accepted:
-                    limiter._submit_accept(load = load)
-            else:
-                # if at least one rejected, do not confirm.
-                # no need to apply rejection as that is done in the previous cycle, on the spot
-                pass
-
-        return LoadLimiterSubmitResult(all_accepted, retry_in=highest_wait_time)
-
-    def instant_load_factor(self) -> float:
-        factors = []
-        with self.lock:
-            for limiter in self.limiters:
-                factors.append(limiter._instant_load_factor())
-        return max(factors)
-     
-    def distribute(self, amount):
-        with self.lock:
-            for limiter in self.limiters:
-                limiter.distribute(amount)
+        self.status_dirty = False

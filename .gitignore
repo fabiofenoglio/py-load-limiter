@@ -1,3 +1,13 @@
 /__pycache__/
 __pycache__
-.vscode
+/.settings/
+/py36/
+/.vscode/
+.project
+.pydevproject
+*.pyc
+/dist/
+/build/
+/note.txt
+.load-limiter.json
+*.egg-info/

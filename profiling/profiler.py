@@ -1,7 +1,7 @@
 import logging
 import time
 import threading
-from load_limiter import LoadLimiter
+from py_load_limiter import LoadLimiter, CompositeLoadLimiter
 from datetime import datetime, timedelta
 from matplotlib import pyplot
 from matplotlib.animation import FuncAnimation
@@ -9,7 +9,6 @@ from random import gauss
 import unicodedata
 import re
 
-from load_limiter.load_limiter import CompositeLoadLimiter
 
 logging.basicConfig(format='%(asctime)s %(threadName)s [%(name)s %(levelname)s] %(message)s', level=logging.DEBUG)
 logging.getLogger("matplotlib").setLevel(logging.INFO)
@@ -68,24 +67,28 @@ class Profiler():
         meter_logger = logging.getLogger("meter")
         meter_logger.setLevel(logging.INFO)
         self.load_meter = LoadLimiter(maxload=limiter.maxload * 100, period=limiter.period, logger=meter_logger)
+        self.accept_meter = LoadLimiter(maxload=limiter.maxload * 100, period=limiter.period, logger=meter_logger)
 
         self.data_lock = threading.Lock()
-        self.run = [True]
-        self.counter = [0]
-        self.wait_until = [None]
-        self.started_at = [datetime.now()]
-        self.total_requested = [0]
-        self.total_served = [0]
-        self.latest_data_update = [datetime.now()]
-        self.data_update_tick_correction_factor = [1.00]
-        self.next_load_cap = [None]
+        self.run = True
+        self.stopped = False
+        self.counter = 0
+        self.wait_until = None
+        self.started_at = datetime.now()
+        self.total_requested = 0
+        self.total_served = 0
+        self.latest_data_update = datetime.now()
+        self.data_update_tick_correction_factor = 1.00
+        self.next_load_cap = None
         self.x_data = []
         self.y_data1a, self.y_data1b = [], [] 
-        self.y_data2a, self.y_data2b = [], []
+        self.y_data2a, self.y_data2b, self.y_data2c = [], [], []
         self.y_data3a, self.y_data3b = [], []
 
+        self.showing_penalty = False
+
     def is_running(self):
-        return self.run[0]
+        return self.run
 
     def start(self) -> threading.Thread:
         # start with some load
@@ -93,12 +96,13 @@ class Profiler():
         if initial_load > 0:
             self.limiter.distribute(initial_load)
             self.load_meter.distribute(initial_load)
+            self.accept_meter.distribute(initial_load)
             
         def data_updater_thread_handler():
-            while self.run[0]:
+            while self.run:
                 with self.data_lock:
                     self.data_updater()
-                time.sleep(self.data_update_tick_correction_factor[0] * self.data_tick_interval_ms / 1000.0)
+                time.sleep(self.data_update_tick_correction_factor * self.data_tick_interval_ms / 1000.0)
 
         self.thread = threading.Thread(target = data_updater_thread_handler, args = ())
         self.thread.start()
@@ -107,18 +111,37 @@ class Profiler():
 
     def stop(self):
         self.logger.info('profiler stopping')
-        self.run[0] = False
+        self.run = False
         self.thread.join()
         self.logger.info('profiler stopped')
-        
+        self.stopped = True
+
+    def _apply_tick_correction(self, now):
+        cf = self.data_update_tick_correction_factor
+        milliseconds_since_last_data_update = (now - self.latest_data_update).total_seconds() * 1000
+        self.logger.info("ELAPSED: %.0f ms, cf %.2f", milliseconds_since_last_data_update, cf)
+        self.latest_data_update = datetime.now()
+
+        if milliseconds_since_last_data_update > self.data_tick_interval_ms:
+            cf -= 0.01
+            if cf < 0.70:
+                cf = 0.70
+                self.logger.warning('correction factor is negatively overflowing')
+        else:
+            cf += 0.01
+            if cf > 1.10:
+                cf = 1.10
+                self.logger.warning('correction factor is positively overflowing')
+        self.data_update_tick_correction_factor = cf
+
     def data_updater(self):
-        if not self.run[0]:
+        if not self.run:
             return
 
         submitter = self.submitter
-        if self.next_load_cap[0] is not None:
-            load = self.next_load_cap[0]
-            self.next_load_cap[0] = None
+        if self.next_load_cap is not None:
+            load = self.next_load_cap
+            self.next_load_cap = None
             self.logger.info('resubmitting previously rejected load of %.2f', load)
         else:
             load = gauss(submitter.avg_load_per_request, (submitter.avg_load_per_request / 3.33))/1000
@@ -129,42 +152,28 @@ class Profiler():
         now = datetime.now()
 
         if self.apply_tick_correction:
-            cf = self.data_update_tick_correction_factor[0]
-            milliseconds_since_last_data_update = (now - self.latest_data_update[0]).total_seconds() * 1000
-            self.logger.info("ELAPSED: %.0f ms, cf %.2f", milliseconds_since_last_data_update, cf)
-            self.latest_data_update[0] = datetime.now()
+            self._apply_tick_correction(now)
 
-            if milliseconds_since_last_data_update > self.data_tick_interval_ms:
-                cf -= 0.01
-                if cf < 0.70:
-                    cf = 0.70
-                    self.logger.warning('correction factor is negatively overflowing')
-            else:
-                cf += 0.01
-                if cf > 1.10:
-                    cf = 1.10
-                    self.logger.warning('correction factor is positively overflowing')
-            self.data_update_tick_correction_factor[0] = cf
-
-        waiting_until = self.wait_until[0]
+        waiting_until = self.wait_until
         if waiting_until is not None and now <= waiting_until:
             return
 
-        total_elapsed = (now - self.started_at[0]).total_seconds()
+        total_elapsed = (now - self.started_at).total_seconds()
         total_elapsed_trimmed = total_elapsed
         if total_elapsed_trimmed < 1:
             total_elapsed_trimmed = 1
 
-        data_index = self.counter[0]
-        self.counter[0] += 1
+        data_index = self.counter
+        self.counter += 1
 
-        self.total_requested[0] += load
+        self.total_requested += load
 
         self.load_meter.submit(load=load)
-
+        
         v1 = self.limiter.submit(load=load)
         if v1.accepted:
             served = load
+            self.accept_meter.submit(load=load)
         else:
             self.logger.info('load of {} was rejected. asked to wait {}s.'.format(load, v1.retry_in))
             served = 0
@@ -173,7 +182,7 @@ class Profiler():
         if submitter.delay_compliance_factor is not None and not v1.accepted and v1.retry_in is not None and v1.retry_in > 0:
             # add portion of the requested delay
             wait_ms_for_compliance = v1.retry_in * 1000 * submitter.delay_compliance_factor
-            self.next_load_cap[0] = load
+            self.next_load_cap = load
             if wait_ms_for_compliance > wait_ms:
                 wait_ms = wait_ms_for_compliance
                 self.logger.info('waiting %.0f ms to comply with delay request', wait_ms)
@@ -182,20 +191,35 @@ class Profiler():
             self.logger.warning('applied trimming to wait time ( <= 0 )')
             wait_ms = self.data_tick_interval_ms
 
-        self.wait_until[0] = now + timedelta(milliseconds=wait_ms)
+        self.wait_until = now + timedelta(milliseconds=wait_ms)
 
-        self.total_served[0] += served
+        self.total_served += served
 
         self.x_data.append(total_elapsed)
 
         self.y_data1a.append(load if v1.accepted else None)
         self.y_data1b.append(load if not v1.accepted else None)
 
-        self.y_data2a.append(self.limiter.window_total)
+        #self.y_data2a.append(self.limiter.window_total)
+        self.y_data2a.append(self.accept_meter.window_total)
         self.y_data2b.append(self.load_meter.window_total)
 
-        avg_served = self.total_served[0] / total_elapsed_trimmed
-        avg_requested = self.total_requested[0] / total_elapsed_trimmed
+        if abs(self.limiter.window_total - self.accept_meter.window_total) >= 1:
+            self.y_data2c.append(self.limiter.window_total)
+            if not self.showing_penalty:
+                # show previous point
+                if data_index > 0 and len(self.y_data2c) >= 3:
+                    self.y_data2c[-2] = self.y_data2b[-2]
+            self.showing_penalty = True
+        elif self.showing_penalty:
+            self.y_data2c.append(self.limiter.window_total)
+            self.showing_penalty = False
+        else:
+            self.y_data2c.append(None)
+            self.showing_penalty = False
+
+        avg_served = self.total_served / total_elapsed_trimmed
+        avg_requested = self.total_requested / total_elapsed_trimmed
 
         self.y_data3a.append(avg_served)
         self.y_data3b.append(avg_requested)
@@ -206,12 +230,13 @@ class Profiler():
             self.y_data1b = self.y_data1b[1:]
             self.y_data2a = self.y_data2a[1:]
             self.y_data2b = self.y_data2b[1:]
+            self.y_data2c = self.y_data2c[1:]
             self.y_data3a = self.y_data3a[1:]
             self.y_data3b = self.y_data3b[1:]
 
         if data_index >= self.total_points:
             self.logger.info('reached total points, terminating')
-            self.run[0] = False
+            self.run = False
 
 class ProfileGraphPrinter():
     def __init__(self, profiler: Profiler):
@@ -225,6 +250,8 @@ class ProfileGraphPrinter():
 
         self.terminate = False
         self.terminated = False
+
+        self.show_penalyzed_load = (profiler.limiter.overstep_penalty > 0 or profiler.limiter.request_overhead_penalty_factor > 0)
 
     def start(self):
 
@@ -252,6 +279,10 @@ class ProfileGraphPrinter():
 
         line2a, = ax2.plot(initial_x, initial_y, '-')
         line2b, = ax2.plot(initial_x, initial_y, color='orange', linestyle='dashed',)
+        if self.show_penalyzed_load:
+            line2c, = ax2.plot(initial_x, initial_y, color='red', linestyle='dashed',)
+        else:
+            line2c = None
 
         line3a, = ax3.plot(initial_x, initial_y, '-')
         line3b, = ax3.plot(initial_x, initial_y, color='orange', linestyle='dashed',)
@@ -260,7 +291,16 @@ class ProfileGraphPrinter():
         ax1.set_ylim(0, self.submitter.avg_load_per_request * 2.50 / 1000)
 
         ax2.axhline(y = self.limiter.maxload, color = 'r', linestyle = 'dotted')
-        ax2.legend([line2b, line2a], ['absolute requested load in window', 'absolute accepted load in window'], loc='upper left')
+
+        ax2.legend(
+            [line2b, line2a] + ([line2c] if self.show_penalyzed_load else []), 
+            [
+                'absolute requested load in window', 
+                'absolute accepted load in window',
+            ] + (['virtual penalyzed load in window'] if self.show_penalyzed_load else []), 
+            loc='upper left'
+        )
+
         ax2_max_y = self.limiter.maxload * (1.33 * self.submitter.load_factor)
         ax2.set_ylim(0, ax2_max_y)
         ax2.annotate("Max load", xy=(1, self.limiter.maxload / ax2_max_y), xycoords='axes fraction')
@@ -280,6 +320,8 @@ class ProfileGraphPrinter():
                 line1b.set_data(self.profiler.x_data, self.profiler.y_data1b)
                 line2a.set_data(self.profiler.x_data, self.profiler.y_data2a)
                 line2b.set_data(self.profiler.x_data, self.profiler.y_data2b)
+                if self.show_penalyzed_load:
+                    line2c.set_data(self.profiler.x_data, self.profiler.y_data2c)
                 line3a.set_data(self.profiler.x_data, self.profiler.y_data3a)
                 line3b.set_data(self.profiler.x_data, self.profiler.y_data3b)
 
@@ -355,8 +397,8 @@ def build_profile_default_limiter_smallpenalty():
     return LoadLimiter(
         maxload=DEFAULT_MAX_LOAD, 
         period=DEFAULT_TIME_PERIOD,
-        penalty_factor=0.05,
-        request_overhead_penalty_factor=0.05
+        penalty_factor=0.33,
+        request_overhead_penalty_factor=0.20
     )
 
 def build_profile_composite_limiter_nopenalty():
@@ -457,6 +499,22 @@ def build_profile_130pc_smallpenalty_delaycompliant():
         submitter=submitter
     )
 
+def build_profile_130pc_smallpenalty_delayuncompliant():
+    limiter = build_profile_default_limiter_smallpenalty()
+
+    submitter = LoadSubmitter(
+        limiter = limiter,
+        load_factor = 1.30,
+        delay_compliance_factor = None,
+        average_request_interval = 300
+    )
+
+    return ProfilingTestBed(
+        name='130% of load, small penalties, not delay compliant',
+        limiter=limiter, 
+        submitter=submitter
+    )
+
 def build_profile_150pc_composite_delayuncompliant():
     limiter = build_profile_composite_limiter_nopenalty()
 
@@ -483,10 +541,11 @@ if __name__ == '__main__':
 
         build_profile_130pc_smallpenalty_delaycompliant(),
         build_profile_150pc_composite_delayuncompliant(),
+        build_profile_130pc_smallpenalty_delayuncompliant(),
     ] 
 
     testbeds =[
-        build_profile_150pc_composite_delayuncompliant(),
+        build_profile_130pc_smallpenalty_delaycompliant(),
     ] 
 
     for testbed in testbeds:

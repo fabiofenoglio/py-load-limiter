@@ -1,7 +1,7 @@
 import time
 import random
 import logging
-from load_limiter import LoadLimiter
+from py_load_limiter import LoadLimiter
 
 logging.basicConfig(format='%(asctime)s %(threadName)s [%(name)s %(levelname)s] %(message)s', level=logging.DEBUG)
 
@@ -19,11 +19,20 @@ def do_expensive():
 def do_really_expensive():
     logging.info('doing REALLY expensive things!')
 
+@limiter(load=15, wait=False)
+def do_really_expensive_no_wait():
+    logging.info('doing REALLY expensive things!')
+
 for i in range(0, 50):
     r = random.randint(1, 10) 
-    if r <= 1:
+    if r <= 2:
+        try:
+            do_really_expensive_no_wait()
+        except Exception as e:
+            logging.error('error calling do_really_expensive_no_wait: ', exc_info=1)
+    elif r <= 4:
         do_really_expensive()
-    elif r <= 3:
+    elif r <= 6:
         do_expensive()
     else:
         do_things()
