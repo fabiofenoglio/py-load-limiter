@@ -2,7 +2,7 @@ import unittest
 import datetime
 from freezegun import freeze_time
 
-from py_load_limiter import LoadLimiter, LoadLimitExceeded, InMemoryLoadLimiterStorageAdapter
+from pyloadlimiter import LoadLimiter, LoadLimitExceeded, InMemoryLoadLimiterStorageAdapter
 
 class TestLoadLimiter(unittest.TestCase):
 

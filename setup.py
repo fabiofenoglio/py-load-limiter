@@ -4,13 +4,13 @@ with open("README.md", "r") as fh:
     long_description = fh.read()
 
 setuptools.setup(
-	name = 'py_load_limiter',
+	name = 'pyloadlimiter',
 	version = '0.1-beta',
 	author = 'Fabio Fenoglio',
 	author_email = 'development@fabiofenoglio.it',
 	long_description=long_description, # Long description read from the the readme file
     long_description_content_type="text/markdown",
-	packages = ['py_load_limiter'],
+	packages = ['pyloadlimiter'],
 	license = 'MIT',
 	description = 'Python variable-sized load limiter',
 	url = 'https://github.com/fabiofenoglio/py-load-limiter',

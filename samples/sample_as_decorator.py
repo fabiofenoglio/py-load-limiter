@@ -1,7 +1,7 @@
 import time
 import random
 import logging
-from py_load_limiter import LoadLimiter
+from pyloadlimiter import LoadLimiter
 
 logging.basicConfig(format='%(asctime)s %(threadName)s [%(name)s %(levelname)s] %(message)s', level=logging.DEBUG)
 

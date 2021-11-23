@@ -1,7 +1,7 @@
 import logging
 import time
 import threading
-from py_load_limiter import LoadLimiter, CompositeLoadLimiter
+from pyloadlimiter import LoadLimiter, CompositeLoadLimiter
 from datetime import datetime, timedelta
 from matplotlib import pyplot
 from matplotlib.animation import FuncAnimation
@@ -59,7 +59,7 @@ class Profiler():
         self.warmup_load_factor = 0.0
         self.data_tick_interval_ms = 20
         self.apply_tick_correction = False
-        self.max_points = (5 * limiter.period * 1000 / submitter.avg_request_interval_ms)
+        self.max_points = (2 * limiter.period * 1000 / submitter.avg_request_interval_ms)
         self.total_points = self.max_points * 2
 
         # configure another LoadLimiter instance with much bigger load. 
@@ -350,7 +350,7 @@ class ProfileGraphPrinter():
 
         graph_updater(None)
 
-        figure.savefig('F:/UPAP/profiling-' + self.slugify(self.profiler.name) + '.jpeg', 
+        figure.savefig('../docs/images/profiling-' + self.slugify(self.profiler.name) + '.jpeg', 
             bbox_inches='tight'
         )
         pyplot.close(figure)
@@ -544,10 +544,11 @@ if __name__ == '__main__':
         build_profile_130pc_smallpenalty_delayuncompliant(),
     ] 
 
-    testbeds =[
-        build_profile_130pc_smallpenalty_delaycompliant(),
+    testbeds_latest =[
+        build_profile_150pc_composite_delayuncompliant(),
+        build_profile_130pc_smallpenalty_delayuncompliant(),
     ] 
 
-    for testbed in testbeds:
+    for testbed in testbeds_all:
         logging.info('running testbed ' + testbed.name)
         do_profile(testbed)

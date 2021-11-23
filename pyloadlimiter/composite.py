@@ -34,6 +34,10 @@ class CompositeLoadLimiter(LoadLimiter):
             return self.widest_limiter.period
         elif name == 'window_total':
             return self.widest_limiter.window_total
+        elif name == 'overstep_penalty':
+            return self.widest_limiter.overstep_penalty
+        elif name == 'request_overhead_penalty_factor':
+            return self.widest_limiter.request_overhead_penalty_factor
 
     def submit(self, load: float = 1) -> LoadLimiterSubmitResult:
         all_accepted = True
