@@ -44,7 +44,7 @@ class TestLoadLimiter(unittest.TestCase):
             self.assertTrue(limiter.submit(4).accepted)
             self.assertEqual(limiter.instant_load_factor(), 1.0)
             r = limiter.submit(1)
-            self.assertGreater(limiter.instant_load_factor(), 1.0)
+            self.assertGreaterEqual(limiter.instant_load_factor(), 1.0)
             self.assertFalse(r.accepted)
             self.assertTrue(r.retry_in > 0 and r.retry_in <=2)
 
